@@ -1,104 +1,177 @@
 ---
 name: gecs-performance
-description: Profile, benchmark and optimize GECS games. Use for query cache tuning, iterate batching, entity lifecycle churn, threshold selection, benchmark commands, regression comparison and identifying ECS versus game-work bottlenecks.
+description: GECS performance optimization guide. Covers column-based iteration, batch operations, cache suppression, archetype explosion avoidance, parallel processing, SystemTimer, and profiling.
 ---
 
-# GECS Performance
+# GECS — Performance Optimization
 
-Profile before optimizing. Separate synthetic ECS work, rendered/game callback work, and frame-rate measurements; do not present one as another.
+## Overview
 
-## Activation Scope
+GECS is a hybrid archetype ECS optimized for Godot 4. Its key performance features are: archetype-level query caching, column (SoA) storage, O(1) entity add/remove via swap-remove, edge-cached archetype transitions, and bitset-based enabled filtering.
 
-- Query optimization
-- System and archetype iteration
-- Component and entity spawn/removal cost
-- Benchmark thresholds
-- Performance regression testing
-- Pool versus spawn/despawn decisions
-- Lifecycle churn reports
-- Debug-viewer performance metrics
+## 1. Column-Based Iteration (Highest Impact)
 
-## Entity Routing
+Instead of `execute()` → iterate entities → `get_component()` per entity, use `archetypes()` for Flecs-style direct array access:
 
-For Entity spawn, prefab lifecycle, pooling reset semantics and SceneTree ownership, use the `gecs-entities` skill. Keep this skill focused on timing, benchmarks and threshold interpretation.
+```gdscript
+# SLOW — O(n) dictionary lookup per entity
+var entities = q.with_all([C_Position, C_Velocity]).execute()
+for entity in entities:
+    var pos = entity.get_component(C_Position)
+    var vel = entity.get_component(C_Velocity)
+    pos.x += vel.dx * delta
 
-## Source Documents
-
-- `docs/PERFORMANCE.md`
-- `docs/PERFORMANCE_OPTIMIZATION.md`
-- `docs/PERFORMANCE_TESTING.md`
-- `docs/ENTITY_LIFECYCLE_PERFORMANCE.md`
-
-## Optimization Order
-
-1. Measure the current workload and establish a baseline.
-2. Enable GECS debug only when inspecting, but profile the final build with debug off for timing comparisons.
-3. Optimize broad queries and structural churn before micro-optimizing GDScript arithmetic.
-4. Prefer component-only specificity over broad type branches.
-5. Use `.iterate([...])` for zero-copy component column batch access where appropriate.
-6. Use `changed([...])` only for meaningful component writes detected by emitting setters.
-7. Group system work with dependencies or groups, not manual `_process` crossings.
-8. Repeat the same hardware, Godot executable, scale, debug setting, and label.
-
-## Query Guidance
-
-- `enabled()` / `disabled()` filters are useful for active entity buckets.
-- `with_all` and property queries are preferable to a broad `with_all` followed by class branching.
-- Split legitimate OR behavior only when the split simplifies logic; `with_any` is valid for real OR semantics.
-- Avoid group queries for performance-critical hot paths; prefer Component markers.
-- Build and execute queries through the System query declaration, not a manually constructed query per entity loop.
-
-## Structural Guidance
-
-- Batch operations when group semantics allow it.
-- Use `cmd` for safe deferred mutation during System iteration.
-- Avoid assuming a CommandBuffer speeds up pure spawn/remove work; it stages the same per-entity lifecycle work and coalesces some costs.
-- Retained empty archetypes can preserve transition edges; call `world.compact()` only at quiet level boundaries.
-- Pool entities only when reset identity/state, memory and game callback contracts are understood.
-- Never share mutable Component instances to improve benchmark creation costs if independence is required.
-
-## Documented Test Thresholds
-
-The historical suite documents these pass/fail targets:
-
-- 100 entities: creation < 10 ms
-- 1,000 entities: creation < 50 ms; world add < 100 ms
-- 100 component adds < 10 ms; 1,000 component adds < 75 ms
-- Simple query at 100/1,000/10,000 entities: < 5/20/100 ms
-- Complex query: < 50 ms
-- 1,000 entity system processing: < 30 ms
-- 10,000 entity system processing: < 150 ms
-- Realistic 1,000-entity game loop: < 16 ms for a 60 FPS target
-
-Use these as the suite's local targets, not universal production hardware guarantees. Lifecycle profile tests document no hardware-dependent pass/fail thresholds.
-
-## Benchmark Commands
-
-```bash
-# Windows/GdUnit suite
-addons/gdUnit4/runtest.cmd -a res://addons/gecs/tests/performance/performance_test_master.gd
+# FAST — O(1) column access, excellent cache locality
+for archetype in q.with_all([C_Position, C_Velocity]).archetypes():
+    var positions  = archetype.get_column(C_Position.get_instance_id())
+    var velocities = archetype.get_column(C_Velocity.get_instance_id())
+    for i in range(positions.size()):
+        positions[i].x += velocities[i].dx * delta
 ```
 
-Lifecycle benchmark:
+## 2. Batch Component Operations
 
-```bash
-GECS_PERF_LABEL=lifecycle-baseline EXTRA_GODOT_ARGS=--no-gecs-debug \
-  tools/run_tests.sh -t 180 \
-  res://addons/gecs/tests/performance/test_entity_lifecycle_perf.gd
+Each `add_component()` / `remove_component()` triggers an archetype move + cache invalidation. Batch operations cost only **one** move:
+
+```gdscript
+# SLOW — 3 archetype moves
+entity.add_component(C_Burning.new())
+entity.add_component(C_Wet.new())
+entity.add_component(C_Frozen.new())
+
+# FAST — 1 archetype move
+entity.add_components([C_Burning.new(), C_Wet.new(), C_Frozen.new()])
 ```
 
-Run a comparison report with distinct labels and retain the patch or commit because Git HEAD alone does not describe uncommitted changes.
+Same for `cmd`:
+```gdscript
+cmd.add_components(entity, [C_A.new(), C_B.new()])   # 1 move
+cmd.remove_components(entity, [C_A, C_B])             # 1 move
+```
 
-## Regression Workflow
+## 3. CommandBuffer for Bulk Mutations
 
-1. Establish the baseline and save raw results.
-2. Change one workload or implementation slice.
-3. Re-run at small, medium and large scales when applicable.
-4. Require repeated regression passes and inspect median/p95/max rather than only averages.
-5. Alert at greater than roughly 20% degradation only after confirming the same environment and workload.
-6. Confirm correctness suites, observers, relationships, IDs and lifecycle callbacks still pass.
+`CommandBuffer.execute()` wraps all commands in `_begin_suppress()` / `_end_suppress()` — cache is invalidated **once** at the end instead of once per command.
 
-## References
+```gdscript
+# System FlushMode.PER_SYSTEM (default) — good
+# System FlushMode.PER_GROUP — better for systems that do lots of mutations
+# System FlushMode.MANUAL — best when you control exactly when to flush
+```
 
-- [Performance API and tactics](references/performance-api.md)
-- [Benchmark workflow example](examples/benchmark-workflow.md)
+## 4. Use safe_iteration = false Carefully
+
+`safe_iteration = true` (default) snapshots the entity array before iteration (O(N) copy). Set to `false` if your `process()` never mutates the entity list:
+
+```gdscript
+@export var safe_iteration: bool = false   # only if no add/remove in process()
+```
+
+## 5. Throttle with SystemTimer
+
+Don't run expensive systems every frame:
+
+```gdscript
+func _ready():
+    tick_source = SystemTimer.new()
+    tick_source.interval = 0.5   # 2 Hz instead of 60 Hz
+```
+
+## 6. Parallel Processing
+
+Enable for CPU-heavy systems with no shared mutable state:
+
+```gdscript
+@export var parallel_processing: bool = true
+# process() must be thread-safe — no scene tree calls, no signals
+```
+
+## 7. Avoid Archetype Explosion
+
+Each unique combination of (components + relationships) creates a new archetype. Excessive archetypes slow down query scans.
+
+**Causes:**
+- Unique entity-to-entity relationships (e.g. 1000 entities each pointing to a different target → 1000 archetypes).
+- Dynamic component sets that vary per entity.
+
+**Solutions:**
+- Use component instances as relationship targets (type matching) instead of entity instances.
+- Share archetypes: entities with the same logical "type" should have the same component set.
+- Monitor: `ECS.world.get_cache_stats()["total_archetypes"]` — >500 triggers a warning in debug mode.
+
+```gdscript
+# BAD — creates N archetypes (one per unique target entity)
+for entity in enemies:
+    entity.add_relationship(Relationship.new(C_Target.new(), player))
+
+# BETTER — use entity ecs_id in a component instead
+var hp: C_Target = C_Target.new()
+hp.target_id = player.ecs_id
+entity.add_component(hp)
+```
+
+## 8. Query Cache Efficiency
+
+Structural queries are cached. Keep queries consistent across frames to maximize cache hits.
+
+```gdscript
+# Check cache stats at runtime
+var stats = ECS.world.get_cache_stats()
+print("Hit rate: ", stats.hit_rate)
+print("Total archetypes: ", stats.total_archetypes)
+print("Invalidations: ", stats.invalidation_count)
+```
+
+## 9. Enabled Filter via Bitset
+
+Using `.with_enabled()` / `.with_disabled()` is O(n/64) via bitset — faster than checking `entity.enabled` manually in a loop.
+
+```gdscript
+var active = q.with_all([C_Unit]).with_enabled().execute()
+```
+
+## 10. Performance Monitoring
+
+Enable per-system Godot Performance monitors:
+
+```gdscript
+@export var performance_monitor: bool = true
+```
+
+Access in Godot Monitor panel:
+- `GECS/SystemName/min_ms`
+- `GECS/SystemName/avg_ms`
+- `GECS/SystemName/max_ms`
+
+## 11. sub_systems() for Multiple Queries
+
+Group related queries under one System node rather than creating many separate nodes:
+
+```gdscript
+func sub_systems() -> Array[Array]:
+    return [
+        [q.with_all([C_Moving]),   _move,   null],
+        [q.with_all([C_Rotating]), _rotate, null],
+    ]
+```
+
+## Summary Table
+
+| Technique | Impact | Notes |
+|---|---|---|
+| Column iteration (`archetypes()`) | ★★★ | Best cache locality |
+| Batch add/remove components | ★★★ | 1 archetype move vs N |
+| CommandBuffer flush control | ★★ | 1 cache invalidation vs N |
+| `safe_iteration = false` | ★ | Small — avoids O(N) snapshot |
+| `parallel_processing = true` | ★★ | CPU-bound only, thread-safe code |
+| `SystemTimer` throttling | ★★★ | Huge for AI/pathfinding |
+| Avoid archetype explosion | ★★★ | Keep <100 archetypes |
+| `with_enabled()` bitset filter | ★ | Faster than manual check |
+
+## See Also
+
+- [`gecs-archetype-world`](../gecs-archetype-world/SKILL.md) — Internals of archetype storage
+- [`gecs-system`](../gecs-system/SKILL.md) — parallel_processing, FlushMode
+- [`gecs-system-timer`](../gecs-system-timer/SKILL.md) — Throttling systems
+- [`gecs-command-buffer`](../gecs-command-buffer/SKILL.md) — Batch mutation
+

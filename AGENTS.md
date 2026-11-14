@@ -1,8 +1,4 @@
-# GECS Agent
-
-@./skills/using-gecs/SKILL.md
-@./skills/using-gecs/references/copilot-tools.md
-
-## Documentation Authority
-
-All files under `docs/` are the source of truth for GECS behavior and API usage. Read them as read-only documentation. Never edit or remove documentation files unless the user explicitly requests that change.
+## Strict Constraint for Small Models
+- You are a code execution engine. Do not act as a co-pilot or creative assistant.
+- Read only the current step. Implement only what is requested in this step.
+- STOP immediately after finishing the step. Do not anticipate or write code for subsequent steps.
